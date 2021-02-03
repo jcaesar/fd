@@ -44,7 +44,7 @@ pub fn is_executable(md: &fs::Metadata) -> bool {
     md.permissions().mode() & 0o111 != 0
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "wasi"))]
 pub fn is_executable(_: &fs::Metadata) -> bool {
     false
 }
@@ -72,7 +72,7 @@ pub fn is_socket(ft: &fs::FileType) -> bool {
     ft.is_socket()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "wasi"))]
 pub fn is_socket(_: &fs::FileType) -> bool {
     false
 }
@@ -82,7 +82,7 @@ pub fn is_pipe(ft: &fs::FileType) -> bool {
     ft.is_fifo()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "wasi"))]
 pub fn is_pipe(_: &fs::FileType) -> bool {
     false
 }
@@ -101,6 +101,12 @@ pub fn osstr_to_bytes(input: &OsStr) -> Cow<[u8]> {
         Cow::Owned(string) => Cow::Owned(string.into_bytes()),
         Cow::Borrowed(string) => Cow::Borrowed(string.as_bytes()),
     }
+}
+
+#[cfg(target_os = "wasi")]
+pub fn osstr_to_bytes(input: &OsStr) -> Cow<[u8]> {
+    use std::os::wasi::ffi::OsStrExt;
+    Cow::Borrowed(input.as_bytes())
 }
 
 /// Remove the `./` prefix from a path.

@@ -131,6 +131,7 @@ pub fn scan(path_vec: &[PathBuf], pattern: Arc<Regex>, config: Arc<Options>) -> 
     let parallel_walker = walker.threads(config.threads).build_parallel();
 
     let wants_to_quit = Arc::new(AtomicBool::new(false));
+    #[cfg(not(target_os = "wasi"))]
     if config.ls_colors.is_some() && config.command.is_none() {
         let wq = Arc::clone(&wants_to_quit);
         ctrlc::set_handler(move || {

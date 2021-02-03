@@ -38,6 +38,7 @@ use crate::regex_helper::{pattern_has_uppercase_char, pattern_matches_strings_wi
     not(windows),
     not(target_os = "android"),
     not(target_os = "macos"),
+    not(target_os = "wasi"),
     not(target_env = "musl")
 ))]
 #[global_allocator]
@@ -70,7 +71,7 @@ fn run() -> Result<ExitCode> {
     }
 
     let current_directory = Path::new(".");
-    if !filesystem::is_dir(current_directory) {
+    if !cfg!(target_os = "wasi") && !filesystem::is_dir(current_directory) {
         return Err(anyhow!(
             "Could not retrieve current directory (has it been deleted?)."
         ));
