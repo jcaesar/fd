@@ -169,10 +169,11 @@ fn spawn_receiver(
     let config = Arc::clone(config);
     let wants_to_quit = Arc::clone(wants_to_quit);
 
-    let show_filesystem_errors = config.show_filesystem_errors;
     let threads = config.threads;
 
     thread::spawn(move || {
+        let show_filesystem_errors = config.show_filesystem_errors;
+
         // This will be set to `Some` if the `--exec` argument was supplied.
         if let Some(ref cmd) = config.command {
             if cmd.in_batch_mode() {
@@ -206,82 +207,109 @@ fn spawn_receiver(
                 merge_exitcodes(&results)
             }
         } else {
-            let start = time::Instant::now();
-
-            let mut buffer = vec![];
-
-            // Start in buffering mode
-            let mut mode = ReceiverMode::Buffering;
-
-            // Maximum time to wait before we start streaming to the console.
-            let max_buffer_time = config
-                .max_buffer_time
-                .unwrap_or_else(|| time::Duration::from_millis(100));
-
             let stdout = io::stdout();
-            let mut stdout = stdout.lock();
-
-            let mut num_results = 0;
+            let mut acceptor = EntryPrinter::new(&config, &wants_to_quit, &stdout);
 
             for worker_result in rx {
-                match worker_result {
-                    WorkerResult::Entry(value) => {
-                        match mode {
-                            ReceiverMode::Buffering => {
-                                buffer.push(value);
-
-                                // Have we reached the maximum buffer size or maximum buffering time?
-                                if buffer.len() > MAX_BUFFER_LENGTH
-                                    || time::Instant::now() - start > max_buffer_time
-                                {
-                                    // Flush the buffer
-                                    for v in &buffer {
-                                        output::print_entry(
-                                            &mut stdout,
-                                            v,
-                                            &config,
-                                            &wants_to_quit,
-                                        );
-                                    }
-                                    buffer.clear();
-
-                                    // Start streaming
-                                    mode = ReceiverMode::Streaming;
-                                }
-                            }
-                            ReceiverMode::Streaming => {
-                                output::print_entry(&mut stdout, &value, &config, &wants_to_quit);
-                            }
-                        }
-
-                        num_results += 1;
-                    }
-                    WorkerResult::Error(err) => {
-                        if show_filesystem_errors {
-                            print_error(err.to_string());
-                        }
-                    }
-                }
-
-                if let Some(max_results) = config.max_results {
-                    if num_results >= max_results {
-                        break;
-                    }
-                }
-            }
-
-            // If we have finished fast enough (faster than max_buffer_time), we haven't streamed
-            // anything to the console, yet. In this case, sort the results and print them:
-            if !buffer.is_empty() {
-                buffer.sort();
-                for value in buffer {
-                    output::print_entry(&mut stdout, &value, &config, &wants_to_quit);
+                if !acceptor.accept(worker_result) {
+                    break;
                 }
             }
 
             ExitCode::Success
         }
     })
+}
+
+struct EntryPrinter<'a> {
+    config: &'a Arc<Options>,
+    start: time::Instant,
+    mode: ReceiverMode,
+    buffer: Vec<PathBuf>,
+    num_results: usize,
+    stdout: io::StdoutLock<'a>,
+    wants_to_quit: &'a Arc<AtomicBool>,
+}
+
+impl<'a> EntryPrinter<'a> {
+    fn new(config: &'a Arc<Options>, wants_to_quit: &'a Arc<AtomicBool>, stdout: &'a io::Stdout) -> EntryPrinter<'a> {
+        EntryPrinter {
+            config: config,
+            start: time::Instant::now(),
+            mode: ReceiverMode::Buffering,
+            buffer: vec![],
+            num_results: 0,
+            stdout: stdout.lock(),
+            wants_to_quit: wants_to_quit,
+        }
+    }
+
+    fn accept(&mut self, worker_result: WorkerResult) -> bool {
+        let show_filesystem_errors = self.config.show_filesystem_errors;
+        // Maximum time to wait before we start streaming to the console.
+        let max_buffer_time = self.config
+            .max_buffer_time
+            .unwrap_or_else(|| time::Duration::from_millis(100));
+        match worker_result {
+            WorkerResult::Entry(value) => {
+                match self.mode {
+                    ReceiverMode::Buffering => {
+                        self.buffer.push(value);
+
+                        // Have we reached the maximum buffer size or maximum buffering time?
+                        if self.buffer.len() > MAX_BUFFER_LENGTH
+                            || time::Instant::now() - self.start > max_buffer_time
+                        {
+                            // Flush the buffer
+                            for v in &self.buffer {
+                                output::print_entry(
+                                    &mut self.stdout,
+                                    v,
+                                    self.config,
+                                    self.wants_to_quit,
+                                );
+                            }
+                            self.buffer.clear();
+
+                            // Start streaming
+                            self.mode = ReceiverMode::Streaming;
+                        }
+                    }
+                    ReceiverMode::Streaming => {
+                        output::print_entry(&mut self.stdout, &value, self.config, self.wants_to_quit);
+                    }
+                }
+
+                self.num_results += 1;
+            }
+            WorkerResult::Error(err) => {
+                if show_filesystem_errors {
+                    print_error(err.to_string());
+                }
+            }
+        }
+
+        if let Some(max_results) = self.config.max_results {
+            if self.num_results >= max_results {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl Drop for EntryPrinter<'_> {
+    fn drop(&mut self) {
+        // If we have finished fast enough (faster than max_buffer_time), we haven't streamed
+        // anything to the console, yet. In this case, sort the results and print them:
+        if !self.buffer.is_empty() {
+            self.buffer.sort();
+            for value in &self.buffer {
+                output::print_entry(&mut self.stdout, value, self.config, self.wants_to_quit);
+            }
+        }
+    }
 }
 
 pub enum DirEntry {
