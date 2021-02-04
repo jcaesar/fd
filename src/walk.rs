@@ -312,12 +312,12 @@ impl Drop for EntryPrinter<'_> {
     }
 }
 
-pub enum DirEntry {
-    Normal(ignore::DirEntry),
+pub enum DirEntry<'a> {
+    Normal(&'a ignore::DirEntry),
     BrokenSymlink(PathBuf),
 }
 
-impl DirEntry {
+impl DirEntry<'_> {
     pub fn path(&self) -> &Path {
         match self {
             DirEntry::Normal(e) => e.path(),
@@ -367,176 +367,177 @@ fn spawn_senders(
                 return ignore::WalkState::Quit;
             }
 
-            let entry = match entry_o {
-                Ok(ref e) if e.depth() == 0 => {
-                    // Skip the root directory entry.
-                    return ignore::WalkState::Continue;
-                }
-                Ok(e) => DirEntry::Normal(e),
-                Err(ignore::Error::WithPath {
-                    path,
-                    err: inner_err,
-                }) => match inner_err.as_ref() {
-                    ignore::Error::Io(io_error)
-                        if io_error.kind() == io::ErrorKind::NotFound
-                            && path
-                                .symlink_metadata()
-                                .ok()
-                                .map_or(false, |m| m.file_type().is_symlink()) =>
-                    {
-                        DirEntry::BrokenSymlink(path)
-                    }
-                    _ => {
-                        match tx_thread.send(WorkerResult::Error(ignore::Error::WithPath {
-                            path,
-                            err: inner_err,
-                        })) {
-                            Ok(_) => {
-                                return ignore::WalkState::Continue;
-                            }
-                            Err(_) => {
-                                return ignore::WalkState::Quit;
-                            }
-                        }
-                    }
-                },
-                Err(err) => match tx_thread.send(WorkerResult::Error(err)) {
-                    Ok(_) => {
-                        return ignore::WalkState::Continue;
-                    }
-                    Err(_) => {
-                        return ignore::WalkState::Quit;
-                    }
-                },
+            let (next, item) = match entry_o {
+                Ok(r) =>  filter_entry(&config, &*pattern, Ok(&r)),
+                Err(e) => filter_entry(&config, &*pattern, Err(e)),
             };
-
-            if let Some(min_depth) = config.min_depth {
-                if entry.depth().map_or(true, |d| d < min_depth) {
-                    return ignore::WalkState::Continue;
+            if let Some(item) = item {
+                if tx_thread.send(item).is_err() {
+                    return ignore::WalkState::Quit;
                 }
             }
 
-            // Check the name first, since it doesn't require metadata
-            let entry_path = entry.path();
-
-            let search_str: Cow<OsStr> = if config.search_full_path {
-                let path_abs_buf = filesystem::path_absolute_form(entry_path)
-                    .expect("Retrieving absolute path succeeds");
-                Cow::Owned(path_abs_buf.as_os_str().to_os_string())
-            } else {
-                match entry_path.file_name() {
-                    Some(filename) => Cow::Borrowed(filename),
-                    None => unreachable!(
-                        "Encountered file system entry without a file name. This should only \
-                         happen for paths like 'foo/bar/..' or '/' which are not supposed to \
-                         appear in a file system traversal."
-                    ),
-                }
-            };
-
-            if !pattern.is_match(&filesystem::osstr_to_bytes(search_str.as_ref())) {
-                return ignore::WalkState::Continue;
-            }
-
-            // Filter out unwanted extensions.
-            if let Some(ref exts_regex) = config.extensions {
-                if let Some(path_str) = entry_path.file_name() {
-                    if !exts_regex.is_match(&filesystem::osstr_to_bytes(path_str)) {
-                        return ignore::WalkState::Continue;
-                    }
-                } else {
-                    return ignore::WalkState::Continue;
-                }
-            }
-
-            // Filter out unwanted file types.
-            if let Some(ref file_types) = config.file_types {
-                if let Some(ref entry_type) = entry.file_type() {
-                    if (!file_types.files && entry_type.is_file())
-                        || (!file_types.directories && entry_type.is_dir())
-                        || (!file_types.symlinks && entry_type.is_symlink())
-                        || (!file_types.sockets && filesystem::is_socket(entry_type))
-                        || (!file_types.pipes && filesystem::is_pipe(entry_type))
-                        || (file_types.executables_only
-                            && !entry
-                                .metadata()
-                                .map(|m| filesystem::is_executable(&m))
-                                .unwrap_or(false))
-                        || (file_types.empty_only && !filesystem::is_empty(&entry))
-                        || !(entry_type.is_file()
-                            || entry_type.is_dir()
-                            || entry_type.is_symlink()
-                            || filesystem::is_socket(entry_type)
-                            || filesystem::is_pipe(entry_type))
-                    {
-                        return ignore::WalkState::Continue;
-                    }
-                } else {
-                    return ignore::WalkState::Continue;
-                }
-            }
-
-            #[cfg(unix)]
-            {
-                if let Some(ref owner_constraint) = config.owner_constraint {
-                    if let Ok(ref metadata) = entry_path.metadata() {
-                        if !owner_constraint.matches(&metadata) {
-                            return ignore::WalkState::Continue;
-                        }
-                    } else {
-                        return ignore::WalkState::Continue;
-                    }
-                }
-            }
-
-            // Filter out unwanted sizes if it is a file and we have been given size constraints.
-            if !config.size_constraints.is_empty() {
-                if entry_path.is_file() {
-                    if let Ok(metadata) = entry_path.metadata() {
-                        let file_size = metadata.len();
-                        if config
-                            .size_constraints
-                            .iter()
-                            .any(|sc| !sc.is_within(file_size))
-                        {
-                            return ignore::WalkState::Continue;
-                        }
-                    } else {
-                        return ignore::WalkState::Continue;
-                    }
-                } else {
-                    return ignore::WalkState::Continue;
-                }
-            }
-
-            // Filter out unwanted modification times
-            if !config.time_constraints.is_empty() {
-                let mut matched = false;
-                if let Ok(metadata) = entry_path.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        matched = config
-                            .time_constraints
-                            .iter()
-                            .all(|tf| tf.applies_to(&modified));
-                    }
-                }
-                if !matched {
-                    return ignore::WalkState::Continue;
-                }
-            }
-
-            let send_result = tx_thread.send(WorkerResult::Entry(entry_path.to_owned()));
-
-            if send_result.is_err() {
-                return ignore::WalkState::Quit;
-            }
-
-            // Apply pruning.
-            if config.prune {
-                return ignore::WalkState::Skip;
-            }
-
-            ignore::WalkState::Continue
+            next
         })
     });
+}
+
+fn filter_entry(
+    config: &Arc<Options>,
+    pattern: &Regex,
+    entry_o: Result<&ignore::DirEntry, ignore::Error>,
+) -> (ignore::WalkState, Option<WorkerResult>) {
+    let empty_ok = (ignore::WalkState::Continue, None);
+
+    let entry = match entry_o {
+        Ok(ref e) if e.depth() == 0 => {
+            // Skip the root directory entry.
+            return empty_ok;
+        }
+        Ok(e) => DirEntry::Normal(e),
+        Err(ignore::Error::WithPath {
+            path,
+            err: inner_err,
+        }) => match inner_err.as_ref() {
+            ignore::Error::Io(io_error)
+                if io_error.kind() == io::ErrorKind::NotFound
+                    && path
+                        .symlink_metadata()
+                        .ok()
+                        .map_or(false, |m| m.file_type().is_symlink()) =>
+            {
+                DirEntry::BrokenSymlink(path)
+            }
+            _ => {
+                return (ignore::WalkState::Continue, Some(WorkerResult::Error(ignore::Error::WithPath {
+                    path,
+                    err: inner_err,
+                })))
+            },
+        },
+        Err(err) => return (ignore::WalkState::Continue, Some(WorkerResult::Error(err))),
+    };
+
+    if let Some(min_depth) = config.min_depth {
+        if entry.depth().map_or(true, |d| d < min_depth) {
+            return empty_ok;
+        }
+    }
+
+    // Check the name first, since it doesn't require metadata
+    let entry_path = entry.path();
+
+    let search_str: Cow<OsStr> = if config.search_full_path {
+        let path_abs_buf = filesystem::path_absolute_form(entry_path)
+            .expect("Retrieving absolute path succeeds");
+        Cow::Owned(path_abs_buf.as_os_str().to_os_string())
+    } else {
+        match entry_path.file_name() {
+            Some(filename) => Cow::Borrowed(filename),
+            None => unreachable!(
+                "Encountered file system entry without a file name. This should only \
+                 happen for paths like 'foo/bar/..' or '/' which are not supposed to \
+                 appear in a file system traversal."
+            ),
+        }
+    };
+
+    if !pattern.is_match(&filesystem::osstr_to_bytes(search_str.as_ref())) {
+        return empty_ok;
+    }
+
+    // Filter out unwanted extensions.
+    if let Some(ref exts_regex) = config.extensions {
+        if let Some(path_str) = entry_path.file_name() {
+            if !exts_regex.is_match(&filesystem::osstr_to_bytes(path_str)) {
+                return empty_ok;
+            }
+        } else {
+            return empty_ok;
+        }
+    }
+
+    // Filter out unwanted file types.
+    if let Some(ref file_types) = config.file_types {
+        if let Some(ref entry_type) = entry.file_type() {
+            if (!file_types.files && entry_type.is_file())
+                || (!file_types.directories && entry_type.is_dir())
+                || (!file_types.symlinks && entry_type.is_symlink())
+                || (!file_types.sockets && filesystem::is_socket(entry_type))
+                || (!file_types.pipes && filesystem::is_pipe(entry_type))
+                || (file_types.executables_only
+                    && !entry
+                        .metadata()
+                        .map(|m| filesystem::is_executable(&m))
+                        .unwrap_or(false))
+                || (file_types.empty_only && !filesystem::is_empty(&entry))
+                || !(entry_type.is_file()
+                    || entry_type.is_dir()
+                    || entry_type.is_symlink()
+                    || filesystem::is_socket(entry_type)
+                    || filesystem::is_pipe(entry_type))
+            {
+                return empty_ok;
+            }
+        } else {
+            return empty_ok;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if let Some(ref owner_constraint) = config.owner_constraint {
+            if let Ok(ref metadata) = entry_path.metadata() {
+                if !owner_constraint.matches(&metadata) {
+                    return empty_ok;
+                }
+            } else {
+                return empty_ok;
+            }
+        }
+    }
+
+    // Filter out unwanted sizes if it is a file and we have been given size constraints.
+    if !config.size_constraints.is_empty() {
+        if entry_path.is_file() {
+            if let Ok(metadata) = entry_path.metadata() {
+                let file_size = metadata.len();
+                if config
+                    .size_constraints
+                    .iter()
+                    .any(|sc| !sc.is_within(file_size))
+                {
+                    return empty_ok;
+                }
+            } else {
+                return empty_ok;
+            }
+        } else {
+            return empty_ok;
+        }
+    }
+
+    // Filter out unwanted modification times
+    if !config.time_constraints.is_empty() {
+        let mut matched = false;
+        if let Ok(metadata) = entry_path.metadata() {
+            if let Ok(modified) = metadata.modified() {
+                matched = config
+                    .time_constraints
+                    .iter()
+                    .all(|tf| tf.applies_to(&modified));
+            }
+        }
+        if !matched {
+            return empty_ok;
+        }
+    }
+
+    // Apply pruning.
+    let skip = match config.prune {
+        true => ignore::WalkState::Skip,
+        false => ignore::WalkState::Continue,
+    };
+
+    (skip, Some(WorkerResult::Entry(entry_path.to_owned())))
 }
