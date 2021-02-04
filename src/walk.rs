@@ -51,7 +51,6 @@ pub fn scan(path_vec: &[PathBuf], pattern: Arc<Regex>, config: Arc<Options>) -> 
     let first_path_buf = path_iter
         .next()
         .expect("Error: Path vector can not be empty");
-    let (tx, rx) = channel();
 
     let mut override_builder = OverrideBuilder::new(first_path_buf.as_path());
 
@@ -128,36 +127,72 @@ pub fn scan(path_vec: &[PathBuf], pattern: Arc<Regex>, config: Arc<Options>) -> 
         walker.add(path_entry.as_path());
     }
 
-    let parallel_walker = walker.threads(config.threads).build_parallel();
-
     let wants_to_quit = Arc::new(AtomicBool::new(false));
+
+    // multithreaded
     #[cfg(not(target_os = "wasi"))]
-    if config.ls_colors.is_some() && config.command.is_none() {
-        let wq = Arc::clone(&wants_to_quit);
-        ctrlc::set_handler(move || {
-            if wq.load(Ordering::Relaxed) {
-                // Ctrl-C has been pressed twice, exit NOW
-                process::exit(ExitCode::KilledBySigint.into());
-            } else {
-                wq.store(true, Ordering::Relaxed);
-            }
-        })
-        .unwrap();
+    {
+        let parallel_walker = walker.threads(config.threads).build_parallel();
+
+        if config.ls_colors.is_some() && config.command.is_none() {
+            let wq = Arc::clone(&wants_to_quit);
+            ctrlc::set_handler(move || {
+                if wq.load(Ordering::Relaxed) {
+                    // Ctrl-C has been pressed twice, exit NOW
+                    process::exit(ExitCode::KilledBySigint.into());
+                } else {
+                    wq.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+        }
+
+        let (tx, rx) = channel();
+
+        // Spawn the thread that receives all results through the channel.
+        let receiver_thread = spawn_receiver(&config, &wants_to_quit, rx);
+
+        // Spawn the sender threads.
+        spawn_senders(&config, &wants_to_quit, pattern, parallel_walker, tx);
+
+        // Wait for the receiver thread to print out all results.
+        let exit_code = receiver_thread.join().unwrap();
+
+        if wants_to_quit.load(Ordering::Relaxed) {
+            Ok(ExitCode::KilledBySigint)
+        } else {
+            Ok(exit_code)
+        }
     }
 
-    // Spawn the thread that receives all results through the channel.
-    let receiver_thread = spawn_receiver(&config, &wants_to_quit, rx);
+    // possibly single-threaded
+    #[cfg(target_os = "wasi")]
+    {
+        anyhow::ensure!(config.command.is_none(), "Executing commands not supported on WASI");
+        let stdout = io::stdout();
+        let mut acceptor = EntryPrinter::new(&config, &wants_to_quit, &stdout);
+        let config_filter = config.clone();
+        let pattern_filter = pattern.clone();
+        walker.filter_entry(move |entry_o| {
+            let (next, _) = filter_entry(&config_filter, &*pattern_filter, Ok(entry_o));
+            next != ignore::WalkState::Skip
+        });
+        for entry_o in walker.build() {
+                let (next, item) = match entry_o {
+                    Ok(r) =>  filter_entry(&config, &*pattern, Ok(&r)),
+                    Err(e) => filter_entry(&config, &*pattern, Err(e)),
+                };
+                if let Some(item) = item {
+                    if !acceptor.accept(item) {
+                        break;
+                    }
+                }
+                if next == ignore::WalkState::Quit {
+                    break;
+                }
+        }
 
-    // Spawn the sender threads.
-    spawn_senders(&config, &wants_to_quit, pattern, parallel_walker, tx);
-
-    // Wait for the receiver thread to print out all results.
-    let exit_code = receiver_thread.join().unwrap();
-
-    if wants_to_quit.load(Ordering::Relaxed) {
-        Ok(ExitCode::KilledBySigint)
-    } else {
-        Ok(exit_code)
+        Ok(ExitCode::Success)
     }
 }
 
